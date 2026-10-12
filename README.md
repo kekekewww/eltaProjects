@@ -1,34 +1,36 @@
-# MLB Highlight Ground Truth and Flag Masking
+# MLB 精華影片剪輯與旗幟遮罩
 
-這個專案包含兩部分：
+這個 repository 維護兩個影片處理領域：MLB 精華影片剪輯，以及旗幟遮罩。另有本機網頁介面串接精華剪輯流程，並可呼叫遮罩工具。
 
-1. 整合 MLB 的 `/feed/live` 與 `/content` API，將棒球轉播影片的逐球事件換算成影片時間，並標記 MLB 官方精華，產生 CSV ground truth。
-2. 使用 Grounding DINO 偵測中國國旗、SAM 2 產生遮罩，再將影片中的目標模糊或像素化。
+MLB 資料工具整合 `/feed/live` 與 `/content` API，將逐球事件換算成影片時間並標記官方精華，產生 CSV ground truth。事件切片與 `highlight_editor` 負責從片段裁切、合併輸出；`highlight_builder` 提供本機網頁與流程編排。旗幟遮罩工具使用 Grounding DINO 偵測中國國旗、SAM 2 產生遮罩，再將目標模糊或像素化。
 
 `/feed/live` 提供逐球時間；`/content` 提供官方精華標題、長度與播放 URL。ground truth 程式預設輸出所有事件，官方精華只作為標籤，不會過濾掉普通事件；它不是影片分類模型。
 
 ## 專案結構
-
 ```text
-sport_hightlight/
-├── csv_data/
-│   ├── bottom2_ground_truth.csv
-│   └── full_game_ground_truth.csv
-├── dataset/
-│   ├── bottom2/
-│   └── full_game/
-│       ├── positive/
-│       ├── hard_negative/
-│       └── manifest.csv
-├── make_clip.py
-└── mlb_highlight_groundtruth.py
-target_mask/
-└── mask_flags.py
-video/
-├── eltaMax10_Reds_Brewers_0913.mp4              # 整場，連續錄影
-├── eltaMax10_Reds_Brewers_0913_bottom2nd.mp4
-└── eltaMax10_Reds_Brewers_0913_top6th.mp4
+.
+├── docs/
+│   ├── api/                          # 網頁 API 與剪輯資料格式
+│   ├── highlight-editor-integration.md
+│   └── superpowers/                  # 設計規格與實作計畫
+├── highlight_builder/                # 本機伺服器、CLI 與流程編排
+├── highlight_editor/                 # 影格精準裁切、驗證與影片合併
+│   ├── tests/
+│   ├── README.md
+│   └── openapi.yaml
+├── sport_hightlight/                 # MLB ground truth 與事件短片產生
+│   ├── csv_data/                     # ground truth CSV
+│   ├── dataset/                      # 事件短片與 manifest
+│   ├── make_clip.py
+│   └── mlb_highlight_groundtruth.py
+├── target_mask/                      # 國旗偵測與遮罩
+│   └── mask_flags.py
+├── tests/                            # 網頁後端與工作流程測試
+├── web/                              # 首頁與工具頁
+└── video/                            # 輸入影片（Git LFS）
 ```
+
+網頁操作路徑為 `web/` → `highlight_builder/` → MLB 工具、`highlight_editor/` 或 `target_mask/`。`highlight_editor` 也可透過 CLI 或 Python API 獨立使用。
 
 影片使用 Git LFS 管理。實際下載影片前，請先安裝並執行：
 
@@ -60,7 +62,7 @@ python -m pip install transformers pillow
 python -m pip install git+https://github.com/facebookresearch/sam2.git
 ```
 
-程式會透過 Hugging Face 載入 Grounding DINO 與 SAM 2 預訓練模型，第一次執行時需要網路連線並下載模型權重。macOS 有可用的 MPS 時，`--device auto` 會使用 MPS，否則使用 CPU；也可用 `--device mps` 或 `--device cpu` 指定裝置。
+程式會透過 Hugging Face 載入 Grounding DINO 與 SAM 2 預訓練模型，第一次執行時需要網路連線並下載模型權重。`--device auto` 依序使用 NVIDIA 顯卡（CUDA）、Apple Silicon 的 MPS，都沒有時使用 CPU；也可用 `--device cuda`、`--device mps` 或 `--device cpu` 指定裝置。使用 CUDA 時，請安裝支援 CUDA 的 PyTorch 版本。
 
 ## 產生單一半局 ground truth
 
@@ -144,6 +146,7 @@ python sport_hightlight/mlb_highlight_groundtruth.py \
 - `audio_calibrated_video_seconds`：音訊校準後的時間
 - `is_official_highlight`：是否配對到 MLB 官方精華
 - `official_highlight_title`、`official_highlight_duration`、`official_highlight_url`：官方精華資訊
+- `batter`、`pitcher`：打者與投手（新版才有；舊 CSV 沒有這兩欄）
 
 ## 產生短片資料集
 
@@ -158,7 +161,81 @@ python sport_hightlight/make_clip.py \
 
 需要系統安裝 `ffmpeg` 與 `ffprobe`。`positive` 是 MLB 官方精華事件，其餘事件放在 `hard_negative`；兩者與 `manifest.csv` 都位於輸出目錄。短片不進版控（見 `.gitignore`），只保留 `manifest.csv`。
 
-整場資料集（指令見「完整轉播模式」）：72 個 20 秒短片，約 1.3 GB，片段之間沒有重疊；依目前配對規則，`positive` 為 16 個、`hard_negative` 為 56 個。`manifest.csv` 除了標籤與時間，還記錄 `game_pk` 與 `source_video`，合併多場比賽時可追溯來源。已存在的短片預設不重新編碼，需要重切請加 `--overwrite`。
+每個事件短片是獨立的 ffmpeg 工作，會平行擷取：`--jobs` 控制同時執行的數量（預設為邏輯核心數 / 4，介於 1 到 8），`--preset` 是 libx264 編碼速度（預設 `veryfast`）。libx264 本身已用多執行緒，所以 `--jobs` 開太大不會再變快；`--preset` 越快、檔案越大。在 32 執行緒 CPU（i9-13980HX）上從 1080p 整場影片切 72 段，預設值（`--jobs 8 --preset veryfast`）約 4~5 分鐘，舊設定（`--jobs 1 --preset fast`）約 8~9 分鐘；兩次冷啟動測試分別快 1.98 倍與 1.77 倍（筆電 CPU 滿載會降頻，數字會浮動）；manifest 相同、每段 frame 數相同，總大小從 1.38 GB 降到 1.18 GB。解析度越低，平行的效果越明顯（540p 片段約快 2.8 倍）。短片先寫成 `*.part.mp4`，完成才改名，中斷時不會留下會被略過的殘缺檔。
+
+有 NVIDIA 顯卡或 Intel 內顯時，可用 `--encoder` 改用硬體編碼；品質設定已調到檔案大小、畫質與 libx264 `veryfast` 相近。以下為 i9-13980HX + RTX 4070 Laptop 的實測，SSIM 為抽 4 段與原始影片比較：
+
+| `--encoder` | 需要的硬體 | 速度（相對 libx264 `veryfast`） | SSIM | 說明 |
+| --- | --- | --- | --- | --- |
+| `libx264`（預設） | 任何 CPU | 1× | 0.9791 | 不同電腦輸出一致，最容易重現 |
+| `nvenc` | NVIDIA 顯卡 | 約 2.5×（整場冷啟動 294 → 117 秒） | 0.9773 | `-cq 26`，整場總大小 1.17 GB |
+| `qsv` | Intel 內顯 | 約 1.5×（24 段）；整場約 122 秒 | 0.9771 | `-global_quality 22`，整場總大小 1.24 GB，CPU 使用率約 40% |
+
+解碼一律使用 CPU：Intel 硬體解碼（`-hwaccel qsv`）會讓片段固定提早 4 格，NVIDIA／Intel 硬體解碼搭配 libx264 也沒有比較快。`--preset` 只對 libx264 有效。指定的硬體編碼器無法使用時，程式會先試編 1 格並直接報錯。硬體編碼的輸出可能因顯卡或驅動版本略有差異。Apple M 系列的 VideoToolbox 尚未支援，需要先在 Mac 上校正品質設定。
+
+整場資料集（指令見「完整轉播模式」）：72 個 20 秒短片，約 1.2 GB（`--preset fast` 時約 1.4 GB），片段之間沒有重疊；依目前配對規則，`positive` 為 16 個、`hard_negative` 為 56 個。`manifest.csv` 除了標籤與時間，還記錄 `game_pk` 與 `source_video`，合併多場比賽時可追溯來源。已存在的短片預設不重新編碼，需要重切請加 `--overwrite`。
+
+### 篩選事件
+
+`make_clip.py` 可以只剪符合條件的事件；不同條件需同時符合，同一條件內的多個值是「任一符合」。片段檔名中的編號仍是 CSV 原本的列號，改變篩選不會讓檔名變動。
+
+| 參數 | 說明 |
+|---|---|
+| `--event-types Strikeout "Home Run"` | 只保留這些 `event_type` |
+| `--batting-team away` / `--pitching-team home` | 依打擊方或投球方篩選；客隊（away）在上半局打擊 |
+| `--batters NAME ...` / `--pitchers NAME ...` | 依打者或投手篩選，需要 CSV 有 `batter`、`pitcher` 欄位 |
+| `--innings 7 9` | 局數範圍 |
+| `--scoring-only`、`--official-only` | 只保留得分事件、只保留 MLB 官方精華 |
+| `--progress-json` | 每處理一個事件就在 stderr 輸出一行 JSON 進度，供後端讀取 |
+
+```bash
+python sport_hightlight/make_clip.py \
+  --ground-truth sport_hightlight/csv_data/full_game_ground_truth.csv \
+  --video video/eltaMax10_Reds_Brewers_0913.mp4 \
+  --out-dir sport_hightlight/dataset/823734_reds_strikeout_homerun \
+  --event-types Strikeout "Home Run" --batting-team away
+```
+
+## 網頁介面（Highlight Builder）
+
+`web/` 是挑選事件並產生片段的網頁，`highlight_builder/` 是它的本機後端。瀏覽器本身不能啟動 Python，因此由本機 HTTP 伺服器提供網頁，並把 API 呼叫轉成 `python -m highlight_builder <指令>` 子程序：結果以一個 JSON 物件輸出到 stdout，進度以 JSON Lines 輸出到 stderr，exit code `0` 成功、`1` 輸入錯誤、`2` 工具錯誤。剪輯輸出由 `highlight_builder` 呼叫 `highlight_editor` 完成。
+
+```bash
+python3 -m highlight_builder.server          # http://localhost:8787，工具頁在 /app
+python3 -m highlight_builder.server --demo   # 強制示範模式
+python3 -m highlight_builder.server --real   # 強制實際執行
+```
+
+### 網頁剪輯流程
+
+```mermaid
+flowchart TD
+  A[啟動本機伺服器] --> B[開啟 localhost:8787/app]
+  B --> C[選擇影片並輸入 game_pk]
+  C --> D[載入比賽事件]
+  D --> E[篩選事件並預覽工作]
+  E --> F[執行 ground truth 與事件切片]
+  F --> G[產生片段與 manifest]
+  G --> H[播放、裁切與排序片段]
+  H --> I[驗證剪輯專案並輸出影片]
+  I --> J[播放 out/ 中的成品]
+```
+
+目前頁面不會自動列出所有可用比賽；載入比賽時需手動輸入 `game_pk`。片段清單會在事件切片工作完成後載入。示範模式只模擬流程，不會建立可播放的片段或成品。
+
+- **示範模式**：沒有安裝 ffmpeg、或 `video/` 裡只有 Git LFS 佔位檔時會自動啟用。執行時走過相同步驟、回報進度，但不呼叫工具、不寫任何檔案，頁面上會標示「示範」。
+- **實際執行**：需要 `git lfs pull` 取得影片、安裝 ffmpeg，以及工具用的 Python 套件（`requests`、`opencv-python`、`numpy`）。後端會自動用專案的 `.venv` 執行工具；要用別的 Python 可設定 `HIGHLIGHT_BUILDER_PYTHON=/path/to/python`。
+- **API 規格**：`docs/api/highlight-builder.openapi.yaml`（OpenAPI 3.1）。後端拒絕未知的工具、未知的參數，以及超出專案資料夾的路徑，而且不透過 shell 執行。
+- **剪輯輸出**：頁面可裁切、排序片段並輸出最終影片；`highlight_editor` 負責影格精準剪輯與合併，整合方式見 [docs/highlight-editor-integration.md](docs/highlight-editor-integration.md)。
+
+CLI 也可以直接使用：
+
+```bash
+python3 -m highlight_builder game 823734            # 隊伍、球員、每個打席
+python3 -m highlight_builder commands job.json      # 列出會執行的指令
+python3 -m highlight_builder run job.json --demo    # 執行（示範模式）
+python3 -m unittest discover -s tests -t .           # 測試
+```
 
 ## 手動指定 anchor
 
@@ -194,7 +271,7 @@ python sport_hightlight/mlb_highlight_groundtruth.py \
 # 2. 刪除舊的短片資料集（避免舊分類殘留）
 rm -rf sport_hightlight/dataset/full_game
 
-# 3. 依 ground truth 從整場影片切出短片（約 3.5 分鐘）
+# 3. 依 ground truth 從整場影片平行切出短片（i9-13980HX 約 4~5 分鐘）
 python sport_hightlight/make_clip.py \
   --ground-truth sport_hightlight/csv_data/full_game_ground_truth.csv \
   --video video/eltaMax10_Reds_Brewers_0913.mp4 \
@@ -257,7 +334,7 @@ python target_mask/mask_flags.py \
 | --- | --- | --- |
 | `--mode` | `blur` | 遮罩效果：`blur`、`pixelate` 或 `debug` |
 | `--prompt` | 中國國旗旗幟與衣物徽章 | Grounding DINO 文字提示；依其慣例使用小寫句子並以句點結尾 |
-| `--device` | `auto` | 運算裝置：`auto`、`mps` 或 `cpu` |
+| `--device` | `auto` | 運算裝置：`auto`、`cuda`、`mps` 或 `cpu` |
 | `--box-thr`、`--text-thr` | `0.10`、`0.10` | 偵測框與文字分數門檻 |
 | `--det-width` | `960` | 偵測與分割使用的縮圖寬度 |
 | `--hold` | `3` | 在當前遮罩之外，合併最多 3 個先前影格的遮罩以減少閃爍 |
